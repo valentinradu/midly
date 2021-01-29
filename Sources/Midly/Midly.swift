@@ -1,3 +1,5 @@
-struct Midly {
-    var text = "Hello, World!"
+import AudioToolbox
+
+public class Midly {
+    public init() {}
 }
