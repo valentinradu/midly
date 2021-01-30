@@ -28,13 +28,21 @@ struct Queue<T: AnyObject> {
             return nil
         }
         
-        return Unmanaged<AnyObject>.fromOpaque(item)
+        return Unmanaged<T>.fromOpaque(item)
             .autorelease()
-            .takeUnretainedValue() as? T
+            .takeUnretainedValue()
     }
     
     func enqueue(_ item: T) throws {
+        let ptr = Unmanaged<T>.passRetained(item)
         
+        do {
+            try queue.enqueue(ptr.toOpaque())
+        }
+        catch let error {
+            ptr.release()
+            throw error
+        }
     }
     
     var head: T? {
@@ -42,8 +50,9 @@ struct Queue<T: AnyObject> {
             return nil
         }
         
-        return Unmanaged<AnyObject>.fromOpaque(item)
+        return Unmanaged<T>.fromOpaque(item)
+            .retain()
             .autorelease()
-            .takeUnretainedValue() as? T
+            .takeUnretainedValue()
     }
 }

@@ -1,3 +1,4 @@
+import Atomics
 import AudioToolbox
 
 private enum Status: UInt32 {
@@ -44,6 +45,9 @@ private class OffBeat {
     }
 }
 
+public typealias VoidClosure = () -> Void
+public typealias BeatClosure = (_ beat: Beat) -> Void
+
 public class Synth {
     fileprivate let ioUnit: AudioUnit
     fileprivate let comp: AudioComponent
@@ -53,12 +57,17 @@ public class Synth {
     fileprivate var beats: [Beat]
     fileprivate let onQueue: Queue<Beat>
     fileprivate let offQueue: Queue<OffBeat>
+    fileprivate var bus: ManagedAtomic<Int>
+    fileprivate var didResume: VoidClosure?
+    fileprivate var didPause: VoidClosure?
+    fileprivate var didBeat: BeatClosure?
     
     public init(bankURL: String, presets _presets: [Int]) throws {
         isRunning = false
         samplerUnits = []
         beats = []
         presets = _presets
+        bus = ManagedAtomic<Int>(0)
         onQueue = try Queue(capacity: 200)
         offQueue = try Queue(capacity: 10)
         
@@ -160,24 +169,11 @@ public class Synth {
                 UInt32(MemoryLayout<AUSamplerInstrumentData>.size))
                 .noErrOr(error: MidlyError.auInitFail)
             
-            var conn = AudioUnitConnection(
-                sourceAudioUnit: samplerUnit,
-                sourceOutputNumber: 0,
-                destInputNumber: 0)
-                
-            try AudioUnitSetProperty(
-                ioUnit,
-                kAudioUnitProperty_MakeConnection,
-                kAudioUnitScope_Input,
-                0,
-                &conn,
-                UInt32(MemoryLayout<AudioUnitConnection>.size))
-                .noErrOr(error: MidlyError.samplerConnFail)
-            
-            AudioUnitAddRenderNotify(
+            try AudioUnitAddRenderNotify(
                 samplerUnit,
                 notifyCallback,
-                UnsafeMutableRawPointer(Unmanaged.passUnretained(self).toOpaque()))
+                Unmanaged.passUnretained(self).toOpaque())
+                .noErrOr(error: MidlyError.auInitFail)
             
             try AudioUnitInitialize(samplerUnit)
                 .noErrOr(error: MidlyError.auInitFail)
@@ -185,6 +181,8 @@ public class Synth {
             samplerUnits.append(samplerUnit)
         }
 
+        try update(bus: 0)
+        
         try AudioUnitInitialize(ioUnit)
             .noErrOr(error: MidlyError.auInitFail)
     }
@@ -193,6 +191,8 @@ public class Synth {
         if !isRunning {
             try AudioOutputUnitStart(ioUnit)
                 .noErrOr(error: MidlyError.auStartFail)
+            
+            isRunning = true
         }
     }
     
@@ -219,14 +219,16 @@ public class Synth {
     public func resume() throws {
         try AudioOutputUnitStart(ioUnit)
             .noErrOr(error: MidlyError.auResumeFail)
+        didResume?()
     }
     
     public func pause() throws {
         try AudioOutputUnitStop(ioUnit)
             .noErrOr(error: MidlyError.auPauseFail)
+        didPause?()
     }
     
-    public func switchBeats(beats _beats: [Beat], asap: Bool = true) throws {
+    public func update(beats _beats: [Beat], asap: Bool = true) throws {
         beats = _beats
         
         if asap {
@@ -255,6 +257,37 @@ public class Synth {
         }
     }
     
+    public func update(bus _bus: Int) throws {
+        let samplerUnit = samplerUnits[_bus]
+        var conn = AudioUnitConnection(
+            sourceAudioUnit: samplerUnit,
+            sourceOutputNumber: 0,
+            destInputNumber: 0)
+            
+        try AudioUnitSetProperty(
+            ioUnit,
+            kAudioUnitProperty_MakeConnection,
+            kAudioUnitScope_Input,
+            0,
+            &conn,
+            UInt32(MemoryLayout<AudioUnitConnection>.size))
+            .noErrOr(error: MidlyError.samplerConnFail)
+        
+        bus.store(_bus, ordering: .relaxed)
+    }
+    
+    public func onBeat(_ callback: @escaping BeatClosure) {
+        didBeat = callback
+    }
+    
+    public func onPause(_ callback: @escaping VoidClosure) {
+        didPause = callback
+    }
+    
+    public func onResume(_ callback: @escaping VoidClosure) {
+        didResume = callback
+    }
+    
     fileprivate func toMach(duration: Double) throws -> UInt64 {
         var machInfo = mach_timebase_info_data_t()
         if mach_timebase_info(&machInfo) != KERN_SUCCESS {
@@ -267,7 +300,9 @@ public class Synth {
         do {
             try stop()
         }
-        catch {}
+        catch {
+            print(error)
+        }
     }
 }
 
@@ -279,8 +314,12 @@ private func notifyCallback(
     inNumberFrames: UInt32,
     ioData: UnsafeMutablePointer<AudioBufferList>?) -> OSStatus
 {
-    let inRef = unsafeBitCast(inRefCon, to: Synth.self)
+    guard ioActionFlags.pointee.contains(.unitRenderAction_PreRender) else {
+        return noErr
+    }
     
+    let inRef = Unmanaged<Synth>.fromOpaque(inRefCon).takeUnretainedValue()
+    let bus = inRef.bus.load(ordering: .relaxed)
     repeat {
         guard let offbeat = inRef.offQueue.head else {
             break
@@ -288,7 +327,7 @@ private func notifyCallback(
         
         if offbeat.timestamp <= inTimeStamp.pointee.mHostTime {
             MusicDeviceMIDIEvent(
-                inRef.samplerUnits[inRef.samplerBus],
+                inRef.samplerUnits[bus],
                 Status.off.rawValue + offbeat.channel,
                 offbeat.pitch,
                 offbeat.velocity,
@@ -312,11 +351,15 @@ private func notifyCallback(
         }
         
         MusicDeviceMIDIEvent(
-            inRef.samplerUnits[inRef.samplerBus],
+            inRef.samplerUnits[bus],
             Status.on.rawValue + onbeat.channel,
             onbeat.pitch,
             onbeat.velocity,
             0)
+        
+        DispatchQueue.main.async {
+            inRef.didBeat?(onbeat)
+        }
         
         do {
             let offset = try inRef.toMach(duration: onbeat.duration)
