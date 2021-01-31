@@ -1,15 +1,15 @@
 @testable import Midly
 import XCTest
 
-private extension Synth {
-    static func test() throws -> Synth {
+private extension Midly {
+    static func test() throws -> Midly {
         guard let url = Bundle.module
             .url(forResource: "soundfont", withExtension: "sf2")
         else {
             fatalError()
         }
 
-        return try Synth(
+        return try Midly(
             bankURL: url.absoluteString,
             presets: [0])
     }
@@ -32,7 +32,7 @@ final class MidlyTests: XCTestCase {
         let resumeExp = self.expectation(description: "Resume callback is called")
         let beatExp = self.expectation(description: "Beat callback is called")
         
-        let synth = try Synth.test()
+        let synth = try Midly.test()
         synth.onBeat { _ in
             beatExp.fulfill()
         }
@@ -51,7 +51,7 @@ final class MidlyTests: XCTestCase {
     }
     
     func testUpdateBeats() throws {
-        let synth = try Synth.test()
+        let synth = try Midly.test()
         try synth.start()
         
         for _ in 0..<10 {
