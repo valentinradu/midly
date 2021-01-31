@@ -42,7 +42,7 @@ final class MidlyTests: XCTestCase {
         synth.onResume {
             resumeExp.fulfill()
         }
-        try synth.update(beats: .test(count: 1, duration: 1))
+        try synth.schedule(beats: .test(count: 1, duration: 1))
         try synth.start()
         try synth.pause()
         try synth.resume()
@@ -55,7 +55,7 @@ final class MidlyTests: XCTestCase {
         try synth.start()
         
         for _ in 0..<10 {
-            try synth.update(beats: .test(count: 1, duration: 1))
+            try synth.schedule(beats: .test(count: 1, duration: 1))
         }
         
         sleep(1)

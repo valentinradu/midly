@@ -1,22 +1,22 @@
 import Atomics
 import AudioToolbox
 
-private enum Status: UInt32 {
+public enum Status: UInt32 {
     case on = 0x90
     case off = 0x80
     case program
 }
 
 public class Beat {
-    public let channel: UInt32
-    public let pitch: UInt32
-    public let velocity: UInt32
+    public let channel: Int
+    public let pitch: Int
+    public let velocity: Int
     public let duration: Double
     
     public init(
-        channel _channel: UInt32,
-        pitch _pitch: UInt32,
-        velocity _velocity: UInt32,
+        channel _channel: Int,
+        pitch _pitch: Int,
+        velocity _velocity: Int,
         duration _duration: Double)
     {
         channel = _channel
@@ -27,20 +27,11 @@ public class Beat {
 }
 
 private class OffBeat {
-    let channel: UInt32
-    let pitch: UInt32
-    let velocity: UInt32
     let timestamp: UInt64
+    let beat: Beat
     
-    init(
-        channel _channel: UInt32,
-        pitch _pitch: UInt32,
-        velocity _velocity: UInt32,
-        timestamp _timestamp: UInt64)
-    {
-        channel = _channel
-        pitch = _pitch
-        velocity = _velocity
+    init(beat _beat: Beat, timestamp _timestamp: UInt64) {
+        beat = _beat
         timestamp = _timestamp
     }
 }
@@ -58,9 +49,9 @@ public class Synth {
     fileprivate let onQueue: Queue<Beat>
     fileprivate let offQueue: Queue<OffBeat>
     fileprivate var bus: ManagedAtomic<Int>
-    fileprivate var didResume: VoidClosure?
-    fileprivate var didPause: VoidClosure?
-    fileprivate var didBeat: BeatClosure?
+    fileprivate var resumeCallback: VoidClosure?
+    fileprivate var pauseCallback: VoidClosure?
+    fileprivate var beatCallback: BeatClosure?
     
     public init(bankURL: String, presets _presets: [Int]) throws {
         isRunning = false
@@ -181,7 +172,7 @@ public class Synth {
             samplerUnits.append(samplerUnit)
         }
 
-        try update(bus: 0)
+        try connect(bus: 0)
         
         try AudioUnitInitialize(ioUnit)
             .noErrOr(error: MidlyError.auInitFail)
@@ -219,31 +210,29 @@ public class Synth {
     public func resume() throws {
         try AudioOutputUnitStart(ioUnit)
             .noErrOr(error: MidlyError.auResumeFail)
-        didResume?()
+        resumeCallback?()
     }
     
     public func pause() throws {
         try AudioOutputUnitStop(ioUnit)
             .noErrOr(error: MidlyError.auPauseFail)
-        didPause?()
+        pauseCallback?()
     }
     
-    public func update(beats _beats: [Beat], asap: Bool = true) throws {
+    public func schedule(beats _beats: [Beat], asap: Bool = true) throws {
         beats = _beats
         
         if asap {
             repeat {
-                guard let beat = offQueue.dequeue() else {
+                guard let offBeat = offQueue.dequeue() else {
                     break
                 }
                 let offset = try toMach(duration: 0.25)
-                let newBeat = OffBeat(
-                    channel: beat.channel,
-                    pitch: beat.pitch,
-                    velocity: beat.velocity,
+                let newOffBeat = OffBeat(
+                    beat: offBeat.beat,
                     timestamp: mach_absolute_time() + offset)
                 do {
-                    try offQueue.enqueue(newBeat)
+                    try offQueue.enqueue(newOffBeat)
                 }
                 catch {}
             }
@@ -257,7 +246,7 @@ public class Synth {
         }
     }
     
-    public func update(bus _bus: Int) throws {
+    public func connect(bus _bus: Int) throws {
         let samplerUnit = samplerUnits[_bus]
         var conn = AudioUnitConnection(
             sourceAudioUnit: samplerUnit,
@@ -276,16 +265,26 @@ public class Synth {
         bus.store(_bus, ordering: .relaxed)
     }
     
+    public func rawEvent(status: Status, pitch: Int, velocity: Int = 100, channel: Int = 0) -> Bool {
+        let status = MusicDeviceMIDIEvent(
+            samplerUnits[bus.load(ordering: .relaxed)],
+            status.rawValue + UInt32(channel),
+            UInt32(pitch),
+            UInt32(velocity),
+            0)
+        return status != noErr
+    }
+    
     public func onBeat(_ callback: @escaping BeatClosure) {
-        didBeat = callback
+        beatCallback = callback
     }
     
     public func onPause(_ callback: @escaping VoidClosure) {
-        didPause = callback
+        pauseCallback = callback
     }
     
     public func onResume(_ callback: @escaping VoidClosure) {
-        didResume = callback
+        resumeCallback = callback
     }
     
     fileprivate func toMach(duration: Double) throws -> UInt64 {
@@ -319,19 +318,17 @@ private func notifyCallback(
     }
     
     let inRef = Unmanaged<Synth>.fromOpaque(inRefCon).takeUnretainedValue()
-    let bus = inRef.bus.load(ordering: .relaxed)
     repeat {
         guard let offbeat = inRef.offQueue.head else {
             break
         }
         
         if offbeat.timestamp <= inTimeStamp.pointee.mHostTime {
-            MusicDeviceMIDIEvent(
-                inRef.samplerUnits[bus],
-                Status.off.rawValue + offbeat.channel,
-                offbeat.pitch,
-                offbeat.velocity,
-                0)
+            _ = inRef.rawEvent(
+                status: .off,
+                pitch: offbeat.beat.pitch,
+                velocity: offbeat.beat.velocity,
+                channel: offbeat.beat.channel)
             
             _ = inRef.offQueue.dequeue()
         }
@@ -350,24 +347,21 @@ private func notifyCallback(
             break
         }
         
-        MusicDeviceMIDIEvent(
-            inRef.samplerUnits[bus],
-            Status.on.rawValue + onbeat.channel,
-            onbeat.pitch,
-            onbeat.velocity,
-            0)
+        _ = inRef.rawEvent(
+            status: .on,
+            pitch: onbeat.pitch,
+            velocity: onbeat.velocity,
+            channel: onbeat.channel)
         
         DispatchQueue.main.async {
-            inRef.didBeat?(onbeat)
+            inRef.beatCallback?(onbeat)
         }
         
         do {
             let offset = try inRef.toMach(duration: onbeat.duration)
             let timestamp = inTimeStamp.pointee.mHostTime + offset
             let offbeat = OffBeat(
-                channel: onbeat.channel,
-                pitch: onbeat.pitch,
-                velocity: onbeat.velocity,
+                beat: onbeat,
                 timestamp: timestamp)
         
             try inRef.onQueue.enqueue(onbeat)
